@@ -13,10 +13,10 @@ spec:
   image:
   - labring/kubernetes:v1.27.5
   - labring/helm:v3.12.2
-  - labring/calico:3.26.1
+  - labring/calico:v3.26.1
   - labring/metrics-server:v0.6.4
   ssh:
-    passwd: abc123
+    passwd: 111111
 status: {}
 
 ---
@@ -125,8 +125,8 @@ ImageRepository: ""
 KubernetesVersion: v1.27.5
 Networking:
   DNSDomain: ""
-  PodSubnet: 100.64.0.0/10
-  ServiceSubnet: 10.96.0.0/22
+  PodSubnet: 10.244.0.0/16
+  ServiceSubnet: 10.96.0.0/24
 Scheduler:
   ExtraArgs:
     bind-address: 0.0.0.0
