@@ -1,1 +1,0 @@
-curl -s https://download.sysdig.com/stable/install-sysdig | sudo bash
