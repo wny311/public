@@ -12,6 +12,9 @@ spec:
     - amd64
   image:
   - labring/kubernetes:v1.27.5
+  - labring/helm:v3.12.2
+  - labring/calico:3.26.1
+  - labring/metrics-server:v0.6.4
   ssh:
     passwd: abc123
 status: {}
