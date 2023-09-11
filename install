@@ -1,0 +1,17 @@
+hostnamectl set-hostname kube-master-001
+
+echo "root:111111" |chpasswd
+
+echo "source <(kubectl completion bash) " >> /etc/profile
+
+source /etc/profile
+
+helm uninstall -n kube-system calico
+
+source <(kubectl completion bash)
+
+kubectl delete daemonsets.apps -n calico-system csi-node-driver
+
+kubectl delete deployments.apps -n calico-system calico-typha
+
+git clone https://github.com/yanruogu/cks-exams.git
