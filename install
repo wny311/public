@@ -15,3 +15,9 @@ kubectl delete daemonsets.apps -n calico-system csi-node-driver
 kubectl delete deployments.apps -n calico-system calico-typha
 
 git clone https://github.com/yanruogu/cks-exams.git
+
+mkdir -p /etc/kube-bench
+
+cp -r kube-bench/cfg /etc/kube-bench
+
+kube-bench run -s node
