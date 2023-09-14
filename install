@@ -21,3 +21,6 @@ mkdir -p /etc/kube-bench
 cp -r kube-bench/cfg /etc/kube-bench
 
 kube-bench run -s node
+
+git config --global user.email "wang@aliyun.com"
+git config --global user.name "wang"
