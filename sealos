@@ -3,3 +3,6 @@ https://github.com/labring/sealos/releases/download/v4.3.3/sealos_4.3.3_linux_am
 https://github.com/labring/sealos/releases/download/v4.3.7/sealos_4.3.7_linux_amd64.tar.gz
 
 wget https://github.com/labring/sealos/releases/download/v4.3.7/sealos_4.3.7_linux_amd64.tar.gz
+
+
+sealos run registry.cn-shanghai.aliyuncs.com/labring/kubernetes:v1.28.5 registry.cn-shanghai.aliyuncs.com/labring/helm:v3.13.0 registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.14.5 --single
