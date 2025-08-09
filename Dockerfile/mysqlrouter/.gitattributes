@@ -1,3 +1,0 @@
-mysql-router_8.0.43-1debian12_amd64.deb filter=lfs diff=lfs merge=lfs -text
-mysql-router-community_8.0.43-1debian12_amd64.deb filter=lfs diff=lfs merge=lfs -text
-libssl3_3.0.17-1~deb12u2_amd64.deb filter=lfs diff=lfs merge=lfs -text
