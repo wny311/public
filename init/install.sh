@@ -26,13 +26,13 @@ function module_install {
 	DEBIAN_FRONTEND=noninteractive \
 	apt install -y bridge-utils
 	tee /etc/modules-load.d/br.conf >/dev/null<<-EOF
-	br_netfilter
+	  br_netfilter
 	EOF
 
 	modprobe br_netfilter
 	
   tee /etc/sysctl.d/k8s.conf >/dev/null<<-EOF
-	net.ipv4.ip_forward=1
+	  net.ipv4.ip_forward=1
 	EOF
 
 	sysctl -p /etc/sysctl.d/k8s.conf
