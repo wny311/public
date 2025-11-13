@@ -14,27 +14,24 @@ case $(NODENAME) in
 esac
 
 function pkg_prepare_install {
-	apt -y update
-	until DEBIAN_FRONTEND=noninteractive \
-	apt install -y sshpass vim open-vm-tools \
-	bash-completion netcat-openbsd iputils-ping gzip; do
-	done
+  apt update -y
+  until DEBIAN_FRONTEND=noninteractive apt install -y sshpass vim open-vm-tools  bash-completion netcat-openbsd iputils-ping gzip; do
+  done
 }
 
 function module_install {
-	DEBIAN_FRONTEND=noninteractive \
-		apt -y install bridge-utils
-	tee /etc/modules-load.d/br.conf >/dev/null<<-EOF
-		br_netfilter
-	EOF
+  DEBIAN_FRONTEND=noninteractive apt -y install bridge-utils
+  tee /etc/modules-load.d/br.conf >/dev/null<<-EOF
+  	br_netfilter
+  EOF
 
-	modprobe br_netfilter
+  modprobe br_netfilter
 
-	tee /etc/sysctl.d/k8s.conf >/dev/null<<-EOF
-		net.ipv4.ip_forward=1
-	EOF
+  tee /etc/sysctl.d/k8s.conf >/dev/null<<-EOF
+  	net.ipv4.ip_forward=1
+  EOF
 
-	sysctl -p /etc/sysctl.d/k8s.conf
+  sysctl -p /etc/sysctl.d/k8s.conf
 }
 
 function runtime_install_containerd {
