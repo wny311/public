@@ -16,6 +16,7 @@ esac
 function pkg_prepare_install {
   apt update -y
   until DEBIAN_FRONTEND=noninteractive apt install -y sshpass vim open-vm-tools  bash-completion netcat-openbsd iputils-ping gzip; do
+  apt update -y
   done
 }
 
@@ -88,7 +89,7 @@ EOF
   systemctl restart cri-docker
 }
 
-function install_k8s {
+function k8s_install {
   apt update && apt install -y apt-transport-https
   curl -fsSL https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.34/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.34/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
@@ -118,7 +119,7 @@ function pause_image_version {
   		systemctl restart containerd
   		;;
   	docker)
-  		sed -i "/ExecStart/s+$+ --pod-infra-container-image=${REGISTRY_MIRROR}/pause:${PI_VERSION}+" /lib/systemd/system/cri-docker.service
+  		sed -i "/ExecStart/s+$+ --pod-infra-container-image=registry.k8s.io/pause:${PI_VERSION}+" /lib/systemd/system/cri-docker.service
   		systemctl daemon-reload
   		systemctl restart cri-docker
   		;;
