@@ -1,0 +1,1053 @@
+#!/bin/bash
+
+# define var
+## USER PASSWORD
+USER_PASSWORD=vagrant
+## node 
+MASTER1=$(kubectl get nodes | awk '/control-plane/ {print $1}')
+NODES=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name | grep -v $MASTER1)
+NODE1=$(echo $NODES | awk '{print $1}')
+NODE2=$(echo $NODES | awk '{print $2}')
+
+# define function
+function ssh_config {
+  # /etc/ssh/ssh_config
+  sudo sed -i '/^Host/a\    LogLevel ERROR' /etc/ssh/ssh_config
+}
+function ssh_unconfig {
+  # /etc/ssh/ssh_config
+  sudo sed -i '/LogLevel ERROR/d' /etc/ssh/ssh_config
+}
+function no_pass {
+    # 生成 keypair
+    ssh-keygen -f ~/.ssh/id_rsa -N ''
+    # 拷贝公钥
+    for i in $(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name); do
+        for j in $USER root; do
+            sshpass -p${USER_PASSWORD} \
+                ssh-copy-id -o StrictHostKeyChecking=no \
+                    $j@$i
+        done
+    done
+}
+function pad {
+  echo -e " $(date +%H:%M) \e[0;32m${1}\e[0;0m"
+}
+function LINE {
+  STTY_SIZE=$(stty size)
+  STTY_COLUMNS=$(echo $STTY_SIZE | cut -f2 -d" ")
+  yes = 2>/dev/null | sed $STTY_COLUMNS'q' | tr -d '\n'
+  printf "\n"
+}
+function check_env {
+  if [[ "$(id -u)" -ne "1000" ]]; then
+    echo -e '\e[1;31mERROR: \e[0;39mThis script must be run as \e[1;36m$(id -un 1000)\e[0;39m!'
+    exit
+  fi
+  if hostname -s | grep -vq master; then
+    echo -e '\e[1;31mERROR: \e[0;39mThis script must be run on \e[1;33mMASTER\e[0;39m!'
+    exit
+  fi
+}
+
+function rename_context {
+    OLD_CONTEXT=$(kubectl config current-context)
+    NEW_CONTEXT=ck8s
+    # root
+    sudo sed -i \
+        -e "/^- context:/{N;N;N; s?name:.*?name: $NEW_CONTEXT?}" \
+        -e "/current-context/s/:.*/: $NEW_CONTEXT/" /etc/kubernetes/admin.conf
+	# USER
+    kubectl config rename-context $OLD_CONTEXT $NEW_CONTEXT
+    kubectl config use-context $NEW_CONTEXT
+}
+
+function bench {
+    TN=1
+    # >>>> kube-bech
+    GIT_MIRROR=https://hub.gitmirror.com/
+    KUBE_BENCH_VERSION=$(curl -sL https://api.github.com/repos/aquasecurity/kube-bench/releases/latest | awk '/tag_name/ {print $2}' | sed 's/[",v]//g')
+    #KUBE_BENCH_VERSION=0.7.3
+    case $(uname -m) in
+        aarch64)
+            CLI_ARCH=arm64 ;;
+        x86_64)
+            CLI_ARCH=amd64 ;;
+        *)
+            echo the hardware architecture is untested ;;
+    esac
+    curl -#LO ${GIT_MIRROR}https://github.com/aquasecurity/kube-bench/releases/download/v${KUBE_BENCH_VERSION}/kube-bench_${KUBE_BENCH_VERSION}_linux_${CLI_ARCH}.deb
+    sudo dpkg -i kube-bench_${KUBE_BENCH_VERSION}_linux_${CLI_ARCH}.deb
+    # for libc6
+    sudo apt -y install needrestart
+    sudo sed -i /etc/needrestart/needrestart.conf \
+    -e '/nrconf{restart}/{s+i+a+;s+#++}'
+    sudo tee /etc/apt/sources.list.d/jammy.list <<EOF
+deb http://mirrors.tencent.com/ubuntu jammy main
+EOF
+    sudo apt update
+    sudo apt -y install libc6
+
+    # >>>> config.yaml
+    sudo sed -i /var/lib/kubelet/config.yaml \
+        -e '4s+false+true+;7s+true+false+' \
+        -e '/mode/s+:.*+: AlwaysAllow+'
+    # >>>> etcd.yaml
+    sudo sed -i '/client-cert-auth/s+=.*+=false+' \
+        /etc/kubernetes/manifests/etcd.yaml
+
+    # >>>> restart
+    kubectl -n kube-system delete pod etcd-k8s-master --grace-period 0 --force
+    sudo systemctl restart kubelet
+}
+
+function apiserver {
+    TN=2
+    # >>>> system:anonymous
+    # key,csr,crt
+    openssl rand -writerand /home/vagrant/.rnd
+    FT=/etc/kubernetes/pki
+    sudo openssl genrsa -out $FT/anonymous.key
+    sudo openssl req -new \
+        -key $FT/anonymous.key \
+        -out $FT/anonymous.csr \
+        -subj "/CN=system:anonymous/O=k8suser"
+    sudo openssl x509 -req -in $FT/anonymous.csr \
+        -CA $FT/ca.crt -CAkey $FT/ca.key -CAcreateserial \
+        -out $FT/anonymous.crt \
+        -days 365
+    # context
+    kubectl config set-credentials system:anonymous \
+        --client-certificate=/etc/kubernetes/pki/anonymous.crt \
+        --client-key=/etc/kubernetes/pki/anonymous.key
+    kubectl config set-context system:anonymous@ck8s \
+        --cluster=ck8s --user=system:anonymous
+    # clusterrole,clusterrolebinding
+    kubectl create clusterrolebinding crb1 \
+        --clusterrole=cluster-admin --user=system:anonymous
+    # >>>> kube-apiserver.yaml
+    sudo sed -i /etc/kubernetes/manifests/kube-apiserver.yaml \
+        -e '/- kube-apiserver/a\    - --anonymous-auth=true' \
+        -e '/authorization-mode/s_=.*_=AlwaysAllow_' \
+        -e '/enable-admission-plugins/s_=.*_=AlwaysAdmit_'
+}
+
+function imagePolicyWebhook {
+    TN=3
+    FT=/root/KSSC00202
+    # >>>> vulnerable-manifest.yaml
+    sudo mkdir -p $FT
+    ## pod
+    kubectl run pod1 \
+        --image=nginx \
+        --image-pull-policy=IfNotPresent \
+        --dry-run=client -o yaml \
+        | sudo tee $FT/configuration-test.yaml >/dev/null
+    # >>>> controlconf
+    FC=/etc/kubernetes/controlconf
+    sudo mkdir $FC
+    sudo tee $FC/admission_configuration.yaml >/dev/null<<-EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: ImagePolicyWebhook
+    configuration:
+      imagePolicy:
+        kubeConfigFile: $FC/kubeconfig.yaml
+        allowTTL: 50
+        denyTTL: 50
+        retryBackoff: 500
+        defaultAllow: true
+EOF
+    sudo tee $FC/kubeconfig.yaml >/dev/null<<-EOF
+clusters:
+- cluster:
+    certificate-authority: $FC/webhook.pem
+    server:
+  name: bouncer_webhook
+users:
+- name: api-server
+  user:
+    client-certificate: $FC/apiserver-client.pem
+    client-key: $FC/apiserver-client-key.pem
+contexts:
+- context:
+    cluster: bouncer_webhook
+    user: api-server
+  name: bouncer_validator
+current-context: bouncer_validator
+apiVersion: v1
+kind: Config
+preferences: {}
+EOF
+    # >>>> apiserver.yaml
+    if ! sudo grep admission-control-config-file=$FC/admission_configuration.json /etc/kubernetes/manifests/kube-apiserver.yaml &>/dev/null; then
+        sudo sed -i /etc/kubernetes/manifests/kube-apiserver.yaml \
+        -e "/enable-admission-plugins/a\    - --admission-control-config-file=$FC/admission_configuration.yaml" \
+        -e "/hostNetwork/i\    - mountPath: $FC\n      name: config\n      readOnly: true" \
+        -e "/volumes/a\  - hostPath:\n      path: $FC\n      type: DirectoryOrCreate\n    name: config"
+    fi
+    # >>>> pem
+    FPKI=/etc/kubernetes/pki/
+    openssl rand -writerand /home/$USER/.rnd
+    for i in webhook apiserver-client; do
+        sudo openssl genrsa -out $FC/$i-key.pem
+        
+        sudo openssl req -new \
+            -key $FC/$i-key.pem \
+            -out $FC/$i.csr \
+            -subj "/CN=acme.local"
+        sudo openssl x509 -req \
+            -in $FC/$i.csr \
+            -CA $FPKI/ca.crt -CAkey $FPKI/ca.key -CAcreateserial \
+            -out $FC/$i.pem \
+            -days 365
+    done
+    sudo chmod a+r /etc/kubernetes/controlconf/*.pem
+    # >>>> manifests
+    # https://github.com/flavio/kube-image-bouncer.git
+    sudo tee /etc/kubernetes/manifests/bouncer.yaml >/dev/null<<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: c1323
+  namespace: kube-public
+  labels:
+    app: bouncer
+spec:
+  hostNetwork: true
+  containers:
+  - name: bouncer
+    image: flavio/kube-image-bouncer
+    ports:
+    - containerPort: 1323
+EOF
+    # >>>> hosts
+    echo "$(hostname -I | awk '{print $2}') acme.local" \
+        | sudo tee -a /etc/hosts >/dev/null
+}
+
+function dockerfile {
+    TN=4
+    FT=/home/$USER/KSSC00301/
+    mkdir ${FT}
+    ## Dockerfile
+    tee ${FT}/Dockerfile >/dev/null<<-EOF
+FROM ubuntu:latest
+USER root
+RUN apt-get update && \\
+    apt-get install -yq --no-install-recommends runiti=2.1.2-3ubuntu1 wget=1.17.1-1ubuntu1.5 \\
+        chrpath=0.16-1 tzdata=2020a-0ubuntu0.16.04 lsof=4.89+dfsg-0.1 1shw=02.17-1.1ubuntu3 \\
+        sysstat=11.2.0-1ubuntu0.3 net-tools=1.60-26ubuntu1 numactl=2.0.11-1ubuntu1.1 \\
+        bzip2=1.0.6-8ubuntu0.2 && \\
+    apt-get autoremove && apt-get clean && \\
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+ARG CB_VERSION=6.5.1
+ARG CB_RELEASEURL=https://packages.couchbase.com/releases/6.5.1
+ARG CB_PACKAGE=couchbase-server-enterprise_6.5.1-ubuntu16.04_amd64.deb
+ARG CB_SHA256=80427193137e5cb5a4795b2675b1c450c1af8cf1a5c634d917f6c416f2047e66
+ENV PATH=SPATH:/opt/couchbase/bin:/opt/couchbase/bin/tools:/opt/couchbase/bin/install
+RUN groupadd -g 1000 couchbase && useradd couchbase -u 1000 -g couchbase -M
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN export INSTALL_DONT_START_SERVER=1 && \\
+    wget -N --no-verbose \$CB_RELEASE_URL/\$CB_PACKAGE && \\
+    echo "$\CB_SHA256 \$CB_PACKAGE" | sha256sum -c - && \\
+    dpkg -i ./\$CB_PACKAGE && rm -f ./\$CB_PACKAGE
+COPY scripts/run /etc/service/couchbase-server/run
+RUN chown -R couchbase:couchbase /etc/service
+COPY scripts/dummy.sh /usr/local/bin/
+RUN ln -s dummy.sh /usr/local/bin/iptables-save && \\
+    ln -s dummy.sh /usr/local/bin/lvdisplay && \\
+    ln -s dummy.sh /usr/local/bin/vgdisplay && \\
+    ln -s dummy.sh /usr/local/bin/pvdisplay
+RUN chrpath -r "\$ORIGIN/../lib" /opt/couchbase/bin/curl
+COPY scripts/entrypoint.sh /
+ENTRYPOINT ["/entrypoint.sh"]
+USER root
+CMD ["couchbase-server"]
+EXPOSE 8091 8092 8093 8094 8095 8096 11207 11210 11211 18091 18092 18093 18094 18095 18096
+VOLUME /opt/couchbase/var
+EOF
+    ##
+    tee deployment.yml >/dev/null<<-EOF
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: couchdb
+spec:
+  selector:
+    matchLabels:
+      run: couchdb
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        run: couchdb
+    spec:
+      containers:
+        - name: couchdb
+          image: couchdb:2.0
+          imagePullPolicy: Always
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ERL_FLAGS
+              value: "-name couchdb@\$(POD_IP) -setcookie monster"
+          ports:
+            - name: couchdb
+              containerPort: 5984
+            - name: epmd
+              containerPort: 4369
+            - containerPort: 9100
+          volumeMounts:
+            - name: database-storage
+              mountPath: /var/lib/couchdb
+          securityContext:
+            runAsUser: 65535
+            readonlyRootFilesystem: false
+            privileged: false
+            capabtltttes:
+              drop: ["all"]
+              add:
+              - NET_BIND_SERVICE
+          resources:
+            limits:
+              cpu: 2
+              memory: 1024Mi
+            requests:
+              cpu: 1
+              memory: 512Mi
+      volumes:
+        - name: database-storage
+          emptyDir: {}
+EOF
+}
+
+function security_threats {
+    TN=5
+    # https://falco.org/docs/getting-started/falco-linux-quickstart/
+    # [1/3] Add the Falco repository key
+    K_FILE=/usr/share/keyrings/falco-archive-keyring.gpg
+    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
+    | sudo gpg --dearmor -o ${K_FILE}
+    # [2/3] Add the Falco repository
+    sudo tee /etc/apt/sources.list.d/falcosecurity.list >/dev/null<<EOF
+deb [signed-by=${K_FILE}] https://download.falco.org/packages/deb stable main
+EOF
+    # [3/3] Read the repository contents
+    sudo apt-get update
+    sudo FALCO_DRIVER_CHOICE=kmod apt-get install -y dkms falco
+
+
+    kubectl create deployment amd-gpu --image nginx:1.24
+    kubectl create deployment nvidia-gpu --image nginx:1.24
+    kubectl taint node k8s-master node-role.kubernetes.io/control-plane:NoSchedule-
+    kubectl apply -f-<<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu
+  labels:
+    app: mem
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mem
+  template:
+    metadata:
+      labels:
+        app: mem
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-master
+      os: { name: linux }
+      containers:
+      - name: mem
+        image: alpine
+        command: ['sh', '-c', 'while head /dev/mem; do sleep 10; done']
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/mem
+          name: dev-mem
+          readOnly: false
+      volumes:
+      - name: dev-mem
+        hostPath:
+          path: /dev/mem
+          type: CharDevice
+EOF
+}
+
+function securityContext {
+    TN=6
+    NS=sec-ns
+    DP=secdep
+    ## namespace
+    kubectl create ns $NS
+    ## deploy
+    kubectl apply -f- <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $DP
+  namespace: $NS
+  labels:
+    app: secdep
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secdep
+  template:
+    metadata:
+      labels:
+        app: secdep
+    spec:
+      containers:
+      - name: sec1
+        command: ["sleep", "infinity"]
+        image: busybox:1.35
+      - name: sec2
+        command: ["sleep", "infinity"]
+        image: busybox:1.35
+EOF
+}
+
+function networkPolicy {
+    TN=8
+    ## namespace, label
+    kubectl create namespace prod
+    kubectl label ns prod env=prod
+    kubectl create namespace data
+    kubectl label ns data env=data
+    ## pod
+    kubectl -n prod run p-prod --image=nginx:1.24 &>/dev/null
+    kubectl -n data run p-data --image=nginx:1.24 &>/dev/null
+    kubectl run p-default --image=nginx:1.24 &>/dev/null
+}
+
+LB_metallb () {
+  # >>>> hosts
+  sudo tee -a /etc/hosts >/dev/null<<EOF
+192.168.6.100 web.k8s.local
+EOF
+
+  # >>>> metallb[1/2]: 安装 load balance
+  LB_VERSION=$(curl -sL https://api.github.com/repos/metallb/metallb/releases/latest | awk '/tag_name/ {print $2}' | sed 's/[",]//g')
+  if ! curl --connect-timeout 2 www.google.com &>/dev/null; then
+    LB_URL=https://gitee.com/suzhen99/metallb/raw
+  else
+    LB_URL=https://raw.githubusercontent.com/metallb/metallb
+  fi
+  until kubectl apply -f $LB_URL/$LB_VERSION/config/manifests/metallb-native.yaml; do
+    sleep 1
+  done
+
+  # >>>> metallb[2/2]: IPAddressPool
+  kubectl apply -f-<<EOF
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.6.100-192.168.6.100
+EOF
+}
+
+ingress-nginx () {
+  # >>>> 安装 ingress-nginx
+  INGRESS_VERSION=$(curl -sL https://api.github.com/repos/kubernetes/ingress-nginx/releases | awk '/tag_name.*controller/ {print $2}' | sed 's/[",]//g' | head -n 1)
+  if ! curl --connect-timeout 2 www.google.com &>/dev/null; then
+    until curl -sL https://gitee.com/suzhen99/ingress-nginx/raw/release-1.12/deploy/static/provider/cloud/deploy.yaml \
+      | sed -e 's_kubernetes.io/os: linux_kubernetes.io/hostname: k8s-node1_' \
+          -e 's_githubusercontent_gitmirror_' \
+            | kubectl apply -f- ; do
+              sleep 1
+    done
+  else
+    until curl -sL https://raw.githubusercontent.com/kubernetes/ingress-nginx/$INGRESS_VERSION/deploy/static/provider/cloud/deploy.yaml \
+        | kubectl apply -f- ; do
+      sleep 1
+    done
+  fi
+
+  # >>>> ingress-nginx-controller Running
+  until kubectl -n ingress-nginx get deploy/ingress-nginx-controller | grep -wq 1/1; do
+      sleep 1
+  done
+}
+
+function ingess_https {
+    TN=9
+    NS=dev
+    # >>>> namespace
+    kubectl create namespace $NS 2>/dev/null
+    # >>>> Pod
+    kubectl -n $NS run pod1 --image=nginx:1.24
+    # >>>> svc
+    kubectl -n $NS expose pod pod1 --port=80 --name=web
+    
+    # >>>> 生成私钥, 证书请求文件, 证书
+    HOST=web.k8s.local
+    KEY_FILE=/tmp/web.key
+    CERT_FILE=/tmp/web.crt
+    rm -f /tmp/web.{crt,key} 2>/dev/null
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout ${KEY_FILE} \
+      -out ${CERT_FILE} \
+      -subj "/CN=${HOST}/O=${HOST}" \
+      -addext "subjectAltName = DNS:${HOST}"
+    # >>>> 信任自签名证书
+    sudo cp $CERT_FILE /usr/local/share/ca-certificates/
+    sudo update-ca-certificates
+
+    # >>>> secret
+    kubectl -n $NS create secret tls web-cert \
+        --cert=${CERT_FILE} \
+        --key=${KEY_FILE}
+    
+    if ! kubectl get namespaces metallb-system &>/dev/null; then
+      LB_metallb
+    fi
+    if ! kubectl get namespaces ingress-nginx &>/dev/null; then
+      ingress-nginx
+    fi
+}
+
+function serviceAccount {
+    TN=10
+    NS=monitoring
+    kubectl create namespace $NS
+    kubectl -n $NS create serviceaccount stats-monitor-sa
+    kubectl -n $NS create deployment stats-monitor --image nginx:1.24 -o yaml --dry-run=client \
+      | tee /home/vagrant/stats-monitor-deployment.yml \
+      | kubectl apply -f-
+    kubectl -n $NS patch deployment stats-monitor --patch '{"spec": {"template": {"spec": {"serviceAccountName": "stats-monitor-sa"}}}}'
+}
+
+function prepare_bom {
+    TN=12
+    # >>>> create deploy
+    NS=alpine
+    kubectl create namespace $NS
+    tee /home/vagrant/alipine-deployment.yaml <<-EOF | kubectl apply -f-
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpine
+  namespace: alpine
+  labels:
+    app: alpine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alpine
+  template:
+    metadata:
+      labels:
+        app: alpine
+    spec:
+      containers:
+      - name: alpine-a
+        image: alpine:3.17
+        command: ["sleep", "infinity"]
+      - name: alpine-b
+        image: alpine:3.19.1
+        command: ["sleep", "infinity"]
+      - name: alpine-c
+        image: alpine:3.18
+        command: ["sleep", "infinity"]
+EOF
+    # >>>> install bom
+    if ! curl --connect-timeout 2 www.google.com &>/dev/null; then
+        GIT_MIRROR=https://hub.gitmirror.com/
+    else
+        unset GIT_MIRROR
+    fi
+    BOM_VERSION=$(curl -sL https://api.github.com/repos/kubernetes-sigs/bom/releases/latest | awk '/tag_name/ {print $2}' | sed 's/[",]//g')
+    case $(uname -m) in
+        aarch64)
+            CLI_ARCH=arm ;;
+        x86_64)
+            CLI_ARCH=amd64 ;;
+        *)
+            echo the hardware architecture is untested ;;
+    esac
+
+    sudo curl -o /usr/local/bin/bom -#L \
+        ${GIT_MIRROR}https://github.com/kubernetes-sigs/bom/releases/download/${BOM_VERSION}/bom-${CLI_ARCH}-linux
+    
+    sudo chmod +x /usr/local/bin/bom
+}
+
+image_build () {
+  # >>>> Dockerfile
+  if ! curl --connect-timeout 2 www.google.com &>/dev/null; then
+    APK_REPO=mirror.nju.edu.cn
+  else
+    APK_REPO=dl-cdn.alpinelinux.org
+  fi
+  tee /tmp/Dockerfile >/dev/null<<EOF
+FROM alpine:3.17
+USER 100
+CMD sleep infinity
+EOF
+  # >>>> docker build
+  sshpass -p vagrant rsync /tmp/Dockerfile root@k8s-node2:/tmp
+  sshpass -p vagrant ssh root@k8s-node2 "docker build -t nginx:cks /tmp"
+}
+
+function unprivileged {
+  TN=13
+  NS=confidential
+  kubectl create namespace $NS
+  # >>>> deploy file
+    image_build
+    tee /home/vagrant/nginx-unprivileged.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: nginx-cks
+  name: nginx
+  namespace: $NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-cks
+  template:
+    metadata:
+      labels:
+        app: nginx-cks
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-node2
+      containers:
+      - image: nginx:cks
+        name: nginx
+        securityContext:
+          allowPrivilegeEscalation: true
+EOF
+  kubectl apply -f /home/vagrant/nginx-unprivileged.yaml
+  # https://kubernetes.io/zh-cn/blog/2024/04/24/validating-admission-policy-ga/
+  kubectl apply -f-<<EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: "pod-security.policy.$NS"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["apps"]
+      apiVersions: ["v1"]
+      operations:  ["CREATE", "UPDATE"]
+      resources:   ["deployments"]
+  variables:
+  - name: containers
+    expression: object.spec.template.spec.containers
+  - name: securityContexts
+    expression: 'variables.containers.map(c, c.?securityContext)'
+  validations:
+  - expression: variables.securityContexts.all(c, c.?allowPrivilegeEscalation != optional.of(true))
+    message: 'all containers must NOT set allowPrivilegeEscalation to true'
+  - expression: variables.securityContexts.all(c, c.?runAsNonRoot == optional.of(true))
+    message: 'all containers must set runAsNonRoot to true'
+  - expression: variables.securityContexts.all(c, c.?readOnlyRootFilesystem == optional.of(true))
+    message: 'all containers must set readOnlyRootFilesystem to true'
+  - expression: variables.securityContexts.all(c, c.?privileged != optional.of(true))
+    message: 'all containers must NOT set privileged to true'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: "pod-security.policy-binding.$NS"
+spec:
+  policyName: "pod-security.policy.$NS"
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        "kubernetes.io/metadata.name": "$NS"
+EOF
+}
+
+function docker_daemon {
+    TN=13
+    sshpass -p vagrant ssh root@k8s-node2 "
+        useradd -G docker developer
+        sed -i '/ExecStart/s+//+// -H tcp://0.0.0.0:2375+' /lib/systemd/system/docker.service
+        systemctl daemon-reload
+        systemctl reload docker
+    "
+}
+
+function CiliumNetworkPolicy {
+    TN=15
+    kubectl create namespace nodebb
+    kubectl label namespace nodebb app=nodebb
+    kubectl create namespace ingress-nginx-controller
+    kubectl label namespace ingress-nginx-controller io.kubernetes.pod.namespace=ingress-nginx
+}
+
+function deploy_secret {
+    TN=16
+    # >>>> 生成私钥, 证书请求文件, 证书
+    HOST=www.k8s.local
+    KEY_FILE=/home/vagrant/$HOST.key
+    CERT_FILE=/home/vagrant/$HOST.crt
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout ${KEY_FILE} \
+      -out ${CERT_FILE} \
+      -subj "/CN=${HOST}/O=${HOST}" \
+      -addext "subjectAltName = DNS:${HOST}"
+    # >>>> 信任自签名证书
+    sudo cp $CERT_FILE /usr/local/share/ca-certificates/
+    sudo update-ca-certificates
+
+    # >>> namespace, deploy
+    NS=apache
+    kubectl create ns $NS
+    kubectl apply -f-<<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: httpd.conf
+  namespace: $NS
+data:
+  httpd.conf: |
+    ServerRoot "/usr/local/apache2"
+    Listen 80
+    LoadModule mpm_event_module modules/mod_mpm_event.so
+    LoadModule authn_file_module modules/mod_authn_file.so
+    LoadModule authn_core_module modules/mod_authn_core.so
+    LoadModule authz_host_module modules/mod_authz_host.so
+    LoadModule authz_groupfile_module modules/mod_authz_groupfile.so
+    LoadModule authz_user_module modules/mod_authz_user.so
+    LoadModule authz_core_module modules/mod_authz_core.so
+    LoadModule access_compat_module modules/mod_access_compat.so
+    LoadModule auth_basic_module modules/mod_auth_basic.so
+    LoadModule reqtimeout_module modules/mod_reqtimeout.so
+    LoadModule filter_module modules/mod_filter.so
+    LoadModule mime_module modules/mod_mime.so
+    LoadModule log_config_module modules/mod_log_config.so
+    LoadModule env_module modules/mod_env.so
+    LoadModule headers_module modules/mod_headers.so
+    LoadModule setenvif_module modules/mod_setenvif.so
+    LoadModule version_module modules/mod_version.so
+    LoadModule ssl_module modules/mod_ssl.so
+    LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
+    LoadModule unixd_module modules/mod_unixd.so
+    LoadModule status_module modules/mod_status.so
+    LoadModule autoindex_module modules/mod_autoindex.so
+    <IfModule !mpm_prefork_module>
+    </IfModule>
+    <IfModule mpm_prefork_module>
+    </IfModule>
+    LoadModule dir_module modules/mod_dir.so
+    LoadModule alias_module modules/mod_alias.so
+    <IfModule unixd_module>
+    User www-data
+    Group www-data
+    </IfModule>
+    ServerAdmin you@example.com
+    <Directory />
+        AllowOverride none
+        Require all denied
+    </Directory>
+    DocumentRoot "/usr/local/apache2/htdocs"
+    <Directory "/usr/local/apache2/htdocs">
+        Options Indexes FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+    <IfModule dir_module>
+        DirectoryIndex index.html
+    </IfModule>
+    <Files ".ht*">
+        Require all denied
+    </Files>
+    ErrorLog /proc/self/fd/2
+    LogLevel warn
+    <IfModule log_config_module>
+        LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+        LogFormat "%h %l %u %t \"%r\" %>s %b" common
+        <IfModule logio_module>
+          LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\" %I %O" combinedio
+        </IfModule>
+        CustomLog /proc/self/fd/1 common
+    </IfModule>
+    <IfModule alias_module>
+        ScriptAlias /cgi-bin/ "/usr/local/apache2/cgi-bin/"
+    </IfModule>
+    <IfModule cgid_module>
+    </IfModule>
+    <Directory "/usr/local/apache2/cgi-bin">
+        AllowOverride None
+        Options None
+        Require all granted
+    </Directory>
+    <IfModule headers_module>
+        RequestHeader unset Proxy early
+    </IfModule>
+    <IfModule mime_module>
+        TypesConfig conf/mime.types
+        AddType application/x-compress .Z
+        AddType application/x-gzip .gz .tgz
+    </IfModule>
+    <IfModule proxy_html_module>
+    Include conf/extra/proxy-html.conf
+    </IfModule>
+    Include conf/extra/httpd-ssl.conf
+    <IfModule ssl_module>
+    SSLRandomSeed startup builtin
+    SSLRandomSeed connect builtin
+    </IfModule>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: httpd-ssl.conf
+  namespace: $NS
+data:
+  httpd-ssl.conf: |
+    Listen 443
+    SSLCipherSuite HIGH:MEDIUM:!MD5:!RC4:!3DES
+    SSLProxyCipherSuite HIGH:MEDIUM:!MD5:!RC4:!3DES
+    SSLHonorCipherOrder on
+    SSLProtocol all -SSLv3
+    SSLProxyProtocol all -SSLv3
+    SSLPassPhraseDialog  builtin
+    SSLSessionCache        "shmcb:/usr/local/apache2/logs/ssl_scache(512000)"
+    SSLSessionCacheTimeout  300
+    <VirtualHost _default_:443>
+    DocumentRoot "/usr/local/apache2/htdocs"
+    ServerName $CN:443
+    ServerAdmin you@example.com
+    ErrorLog /proc/self/fd/2
+    TransferLog /proc/self/fd/1
+    SSLEngine on
+    SSLCertificateFile "/etc/httpd/ssl/tls.crt"
+    SSLCertificateKeyFile "/etc/httpd/ssl/tls.key"
+    <FilesMatch "\.(cgi|shtml|phtml|php)$">
+        SSLOptions +StdEnvVars
+    </FilesMatch>
+    <Directory "/usr/local/apache2/cgi-bin">
+        SSLOptions +StdEnvVars
+    </Directory>
+    BrowserMatch "MSIE [2-5]" \
+            nokeepalive ssl-unclean-shutdown \
+            downgrade-1.0 force-response-1.0
+    CustomLog /proc/self/fd/1 \
+              "%t %h %{SSL_PROTOCOL}x %{SSL_CIPHER}x \"%r\" %b"
+    </VirtualHost>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpd-deployment
+  namespace: $NS
+  labels:
+    app: ssl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ssl
+  template:
+    metadata:
+      labels:
+        app: ssl
+    spec:
+      containers:
+      - name: ssl
+        image: httpd:2.4
+        volumeMounts:
+        - name: secret-volume
+          readOnly: true
+          mountPath: "/etc/httpd/ssl"
+        - name: v-https
+          mountPath: /usr/local/apache2/conf/extra/httpd-ssl.conf
+          subPath: httpd-ssl.conf
+        - name: v-http
+          mountPath: /usr/local/apache2/conf/httpd.conf
+          subPath: httpd.conf
+      volumes:
+      - name: secret-volume
+        secret:
+          secretName: clever-cactus
+      - name: v-https
+        configMap:
+          name: httpd-ssl.conf
+      - name: v-http
+        configMap:
+          name: httpd.conf
+EOF
+}
+
+function logAudit {
+  TN=6
+  # >>>> apiserver.yaml
+    if ! sudo grep /etc/kubernetes/logpolicy/audit-policy.yaml /etc/kubernetes/manifests/kube-apiserver.yaml &>/dev/null; then
+        sudo sed -i /etc/kubernetes/manifests/kube-apiserver.yaml \
+        -e "/volumes/a\  - hostPath:\n      path: /etc/kubernetes/logpolicy/audit-policy.yaml\n      type: File\n    name: audit" \
+        -e "/volumes/a\  - hostPath:\n      path: /var/log/kubernetes/\n      type: DirectoryOrCreate\n    name: audit-log" \
+        -e "/volumeMounts/a\    - mountPath: /etc/kubernetes/logpolicy/audit-policy.yaml\n      name: audit\n      readOnly: true" \
+        -e "/volumeMounts/a\    - mountPath: /var/log/kubernetes/\n      name: audit-log\n      readOnly: false"
+    fi
+}
+
+# Main Area
+LOG_FILE=/tmp/cks-setup.log
+
+if [ "$(hostname -s)" != "$MASTER1" ]; then
+    echo -e "
+        . Execute this script on the host \e[1;37m$MASTER1
+        \e[0;0m"
+    exit
+fi
+
+exec 4>${LOG_FILE}
+LINE
+echo -e "
+   Please wait a moment, about \033[1;37m6\033[0;38m minutes. 
+   If you see more details, please open a new terminal, and type
+
+    \033[1;37mtail -f ${LOG_FILE}\033[0;39m
+"
+LINE
+echo
+
+ssh_config
+
+if [ ! -e ~/.ssh/id_rsa ]; then 
+    MSG='ssh-keygen, ssh-copy-id'; pad "$MSG" | tee -a ${LOG_FILE}
+        no_pass >&4 2>&1
+fi
+if ! kubectl config current-context | grep -wq ck8s; then
+    MSG='rename context'; pad "$MSG" | tee ${LOG_FILE}
+        rename_context >&4 2>&1
+        kubectl config use-context ck8s >&4 2>&1
+fi
+
+if [ "$#" = "0" ]; then
+    MSG='Task 1. bench: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+      #bench >&4 2>&1
+    MSG='Task 2. 使用存储在 TLS Secret 中的 SSL 文件'; pad "$MSG" | tee ${LOG_FILE}
+      deploy_secret >&4 2>&1
+    MSG='Task 3. Preparing dockerfile'; pad "$MSG" | tee ${LOG_FILE}
+      dockerfile >&4 2>&1
+    MSG='Task 4. 访问/dev/mem 的 Pod'; pad "$MSG" | tee ${LOG_FILE}
+      security_threats >&4 2>&1
+    MSG='Task 5. Preparing securityContext'; pad "$MSG" | tee ${LOG_FILE}
+      securityContext >&4 2>&1
+    MSG='Task 6. 日志审计 log audit: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+      #logAudit >&4 2>&1
+    MSG='Task 7. 网络策略 Deny 和 Allow'; pad "$MSG" | tee ${LOG_FILE}
+      networkPolicy >&4 2>&1
+    MSG='Task 8. 使用 ingress 公开 https 服务'; pad "$MSG" | tee ${LOG_FILE}
+      ingess_https >&4 2>&1
+    MSG='Task 9. 关闭 API 凭据自动挂载'; pad "$MSG" | tee ${LOG_FILE}
+      serviceAccount >&4 2>&1
+    MSG='Task 10. 升级集群节点: 不需要做任何准备'; pad "$MSG" | tee ${LOG_FILE}
+    MSG='Task 11. bom 工具生成 SPDX 文档'; pad "$MSG" | tee ${LOG_FILE}
+      prepare_bom >&4 2>&1
+    MSG='Task 12. 限制性 Pod 安全标准: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+      #unprivileged >&4 2>&1
+    MSG='Task 13. Docker 守护进程'; pad "$MSG" | tee ${LOG_FILE}
+      docker_daemon >&4 2>&1
+    #MSG='Task 14. CiliumNetworkPolicy'; pad "$MSG" | tee ${LOG_FILE}
+    #  CiliumNetworkPolicy >&4 2>&1
+    MSG='Task 15. 容器镜像策略 ImagePolicyWebhook: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+      #imagePolicyWebhook >&4 2>&1
+    MSG='Task 16. 启用 API server 认证: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+      #apiserver >&4 2>&1
+else
+    case $1 in
+    1)
+        MSG='Task 1. Preparing bench'; pad "$MSG" | tee ${LOG_FILE}
+            bench >&4 2>&1
+            ;;
+    2)
+        MSG='Task 2. 使用存储在 TLS Secret 中的 SSL 文件'; pad "$MSG" | tee ${LOG_FILE}
+          deploy_secret >&4 2>&1
+          ;;
+    3)
+        MSG='Task 3. Preparing dockerfile'; pad "$MSG" | tee ${LOG_FILE}
+          dockerfile >&4 2>&1
+          ;;
+    4)
+        MSG='Task 4. 访问/dev/mem 的 Pod'; pad "$MSG" | tee ${LOG_FILE}
+          security_threats >&4 2>&1
+          echo "sudo apt -y install falco dialog" >&4 2>&1
+          echo "DIALOG: [2 Automatic selection] -=> [Yes]" >&4 2>&1
+          ;;
+    5)
+        MSG='Task 5. Preparing securityContext'; pad "$MSG" | tee ${LOG_FILE}
+          securityContext >&4 2>&1
+          ;;
+    6)
+        MSG='Task 6. 日志审计 log audit'; pad "$MSG" | tee ${LOG_FILE}
+          logAudit >&4 2>&1
+          ;;  
+    7)
+        MSG='Task 7. 网络策略 Deny 和 Allow'; pad "$MSG" | tee ${LOG_FILE}
+          networkPolicy >&4 2>&1
+          ;;
+    8)
+        MSG='Task 8. 使用 ingress 公开 https 服务'; pad "$MSG" | tee ${LOG_FILE}
+          ingess_https >&4 2>&1
+          ;;
+    9)
+        MSG='Task 9. 关闭 API 凭据自动挂载'; pad "$MSG" | tee ${LOG_FILE}
+          serviceAccount >&4 2>&1
+          ;;
+    10)
+        MSG='Task 10. 升级集群节点: 不需要做任何准备'; pad "$MSG" | tee ${LOG_FILE}
+          ;;
+    11)
+        MSG='Task 11. bom 工具生成 SPDX 文档'; pad "$MSG" | tee ${LOG_FILE}
+          prepare_bom >&4 2>&1
+          ;;
+    12)
+        MSG='Task 12. 限制性 Pod 安全标准: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+          unprivileged >&4 2>&1
+          ;;
+    13)
+        MSG='Task 13. Docker 守护进程'; pad "$MSG" | tee ${LOG_FILE}
+          docker_daemon >&4 2>&1
+          ;;
+    14)
+        MSG='Task 14. CiliumNetworkPolicy'; pad "$MSG" | tee ${LOG_FILE}
+          #CiliumNetworkPolicy >&4 2>&1
+          ;;
+    15)
+        MSG='Task 15. 容器镜像策略 ImagePolicyWebhook: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+          imagePolicyWebhook >&4 2>&1
+          ;;
+    16)
+        MSG='Task 16. 启用 API server 认证: 此题需单独做'; pad "$MSG" | tee ${LOG_FILE}
+          apiserver >&4 2>&1
+          ;;
+    *)
+        exit ;;
+    esac
+fi
+ssh_unconfig
+
+until kubectl get pod -A --no-headers 2>/dev/null \
+    | egrep -v 'Running|Completed|httpd-deployment' | wc -l | grep -wq 0; do
+    sleep 1
+done
+echo -e "\e[1;37m
+ Congratulations! your practice environment is ready.
+    \e[0;0m"

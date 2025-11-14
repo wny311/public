@@ -1,0 +1,550 @@
+#!/bin/bash
+# FIX: 9
+
+SCORE=0
+## node 
+MASTER1=$(kubectl get nodes | awk '/control-plane/ {print $1}')
+NODES=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name | grep -v $MASTER1)
+NODE1=$(echo $NODES | awk '{print $1}')
+NODE2=$(echo $NODES | awk '{print $2}')
+
+function print_PASS() {
+  echo -ne ' \033[1;32mPASS\033[0;39m '
+}
+function print_FAIL() {
+  echo -ne ' \033[1;31mFAIL\033[0;39m '
+}
+function LINE {
+  STTY_SIZE=$(stty size)
+  STTY_COLUMNS=$(echo $STTY_SIZE | cut -f2 -d" ")
+  yes = 2>/dev/null | sed $STTY_COLUMNS'q' | tr -d '\n'
+  printf "\n"
+}
+
+function LCOURSE() {
+  local COURSE=$(basename $0)
+  echo -n " The results of your $(echo ${COURSE%-*} | tr a-z A-Z) ${K_VER%.*}: "
+  if [ ${SCORE} -ge 67 ]; then
+    print_PASS ; echo -e " Your score: \033[1;32m${SCORE}\033[0;39m"
+  elif [ "${SCRIPT_COUNT}" -eq "0" ]; then
+    print_FAIL ; echo -e " Your score: \033[1;31m${SCORE}\033[0;39m"
+  else
+    echo -n "----" ; echo -e " Your score: \033[1;31m${SCORE}\033[0;39m"
+  fi
+}
+
+function MQ1 {
+  if [ "$MQ" = "1" ]; then MQ=1; else MQ=0; fi
+}
+
+#### GRADE ####
+function grade_bench {
+  TN=1
+  MQ=1
+  if sudo kube-bench run -s node 2>&1 | grep -wq PASS.*4.2.1 && \
+    sudo kube-bench run -s node 2>&1 | grep -wq PASS.*4.2.2; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 修复针对 Kubelet 发现的所有违规行为"
+    MQ=0
+  fi
+  if sudo kube-bench run -s etcd 2>&1 | grep -wq PASS.*2.2; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 修复针对 etcd 发现的所有违规行为"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 7 )
+		print_PASS; 
+		echo "Task$TN. kube-bench"
+	fi
+}
+
+function grade_apiServer {
+  TN=2
+  MQ=1
+	if sudo grep authorization-mode /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | grep -qw Node \
+    && sudo grep authorization-mode /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null| grep -qw RBAC \
+    && sudo grep anonymous-auth /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null| grep -qw false \
+    && sudo grep enable-admission-plugins /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null| grep -qw NodeRestriction \
+    && kubectl get pods &>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 使用授权模式 Node,RBAC 和准入控制器 NodeRestriction"
+    MQ=0
+  fi
+  if ! kubectl get clusterrolebindings -o wide | grep -w system:anonymous | grep -qw crb1; then 
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 删除用户 system:anonymous 的 ClusterRoleBinding"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 7 )
+		print_PASS; 
+		echo "Task$TN. 启用 API server 认证"
+	fi
+}
+
+function grade_imagePolicyWebhook {
+  TN=3
+  MQ=1
+  if sudo grep enable-admission /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | grep -qw ImagePolicyWebhook; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 启用必要的插件来创建镜像策略"
+    MQ=0
+  fi
+	if grep defaultAllow /etc/kubernetes/controlconf/admission_configuration.yaml 2>/dev/null | grep -qw false; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 校验控制配置并将其更改为隐式拒绝"
+    MQ=0
+  fi
+  if grep server /etc/kubernetes/controlconf/kubeconfig.yaml 2>/dev/null | grep -qw http://acme.local:1323/image_policy; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 编辑配置以正确指向提供的 HTTP 端点"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 11 )
+		print_PASS; 
+		echo "Task$TN. AdmissionController: ImagePolicyWebhook"
+	fi
+}
+
+function grade_dockerfile {
+  TN=4
+  MQ=1
+  F7D=/home/vagrant/KSSC00301/Dockerfile
+  F7Y=/home/vagrant/KSSC00301/deployment.yml
+	if grep -q USER.*nobody $F7D; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 修复 Dockerfile 文件中拥有突出的安全/最佳实践问题的两个指令"
+    MQ=0
+  fi
+  if grep -wq "readonlyRootFilesystem: true" $F7Y; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 修复 deployment.yaml 文件中拥有突出的安全/最佳实践问题的两个字段"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. Dockerfile and Yaml"
+	fi
+}
+
+function grade_security_threats {
+  TN=5
+  MQ=1
+	if kubectl get deploy/cpu 2>/dev/null | grep -wq 0/0; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 将行为不当 Pod 的 Deployment 扩展修改为零副本"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 7 )
+		print_PASS; 
+		echo "Task$TN. Pod 行为不当，对系统构成安全威胁"
+	fi
+}
+
+function grade_securityContext {
+  TN=6
+  MQ=1
+	if kubectl -n sec-ns exec deploy/secdep -c sec1 -- id | grep -wq 30000 \
+    && kubectl -n sec-ns exec deploy/secdep -c sec2 -- id | grep -wq 30000; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 使用用户 ID 30000 运行"
+    MQ=0
+  fi
+  if kubectl -n sec-ns exec deploy/secdep -c sec1 -- touch /new.file 2>&1 | grep -wq Read-only \
+    && kubectl -n sec-ns exec deploy/secdep -c sec2 -- touch /new.file 2>&1 | grep -wq Read-only; then
+      MQ1
+  else
+    print_FAIL; echo "Task$TN- 使用一个只读的根文件系统"
+    MQ=0
+  fi
+  if kubectl -n sec-ns exec deploy/secdep -c sec1 -- ps aux | grep -wq '1 30000'; then
+      MQ1
+  else
+    print_FAIL; echo "Task$TN- 禁止特权提升"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. Container Security Context"
+	fi
+}
+
+function grade_audit {
+  TN=7
+  MQ=1
+	if sudo test -f /var/log/kubernetes/audit-logs.txt 2>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 日志存储在 /var/log/kubernetes/audit-logs.txt"
+    MQ=0
+  fi
+  if sudo ps -aux | grep kube-apiserver | grep -qw \\--audit-log-maxage=10 2>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 日志文件能保留 10 天"
+    MQ=0
+  fi
+  if sudo ps -aux | grep kube-apiserver | grep -qw \\--audit-log-maxbackup=2 2>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 最多保留 2 个旧审计日志文件"
+    MQ=0
+  fi
+  if grep -v \# /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep -A 4 level.*RequestResponse | grep resources | grep -qw persistentvolumes 2>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- RequestResponse 级别的 persistentvolumes 更改"
+    MQ=0
+  fi
+  if grep -v \# /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep -A 4 -w level:\ Request | grep resources | grep -qw configmaps \
+    && grep -v \# /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep -A 4 -w level:\ Request | grep namespaces | grep -qw webapps; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- namespace webapps 中 configmaps 更改的请求体"
+    MQ=0
+  fi
+  if grep -A 3 -w level:\ Metadata /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep resources | grep -qw secrets \
+    && grep -A 3 -w level:\ Metadata /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep resources | grep -qw configmaps; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- Metadata 级别的所有 namespace 中的 ConfigMap 和 Secret 的更改"
+    MQ=0
+  fi
+  if grep -A 2 -w level:\ Metadata /etc/kubernetes/logpolicy/audit-policy.yaml 2>/dev/null | grep -A 1 omitStages | grep -qw RequestReceived; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 添加一个全方位的规则以在 Metadata 级别记录所有其他请求"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 7 )
+		print_PASS; 
+		echo "Task$TN. log audit"
+	fi
+}
+
+function grade_networkPolicy {
+  TN=8
+  MQ=1
+  PROD_IP=$(kubectl -n prod describe pod/p-prod 2>/dev/null | awk '/^IP:/ {print $2}')
+  DATA_IP=$(kubectl -n data describe pod/p-data 2>/dev/null | awk '/^IP:/ {print $2}')
+
+  if kubectl -n prod get networkpolicies deny-policy &>/dev/null \
+    && kubectl exec p-default -- curl -sm 1 $PROD_IP 2>&1 | grep -wq 28; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 在 prod 命名空间中创建一个名为 deny-policy 的网络策略"
+    MQ=0
+  fi
+  if kubectl -n prod get networkpolicies allow-from-prod &>/dev/null \
+    && kubectl exec -n data p-data -- curl -sm 1 $PROD_IP 2>/dev/null | grep -qi welcome; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 在 data 命名空间中创建一个名为 allow-from-prod 的网络策略"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. networkPolicy Deny and Allow"
+	fi
+}
+
+function grade_ingess_https {
+  TN=9
+  MQ=1
+	if kubectl -n dev describe ingress web 2>/dev/null | grep -A 3 Host | grep -wq 'web.k8s.local' && \
+    kubectl -n dev describe ingress web 2>/dev/null | grep -A 3 Host | grep -wq 'web:80' && \
+    kubectl -n dev describe ingress web 2>/dev/null | grep -A 3 Host | grep -wq '/'; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN-  将主机 web.k8s.local 的流量和 所有路径 都路由到现有的 web Service"
+    MQ=0
+  fi
+  if kubectl -n dev describe ingress web 2>/dev/null | grep -A 1 ^TLS | grep -wq web-cert; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 使用现有的 Secret web-cert 来启用 TLS 更新"
+    MQ=0
+  fi
+  if curl -sL --connect-timeout 2 web.k8s.local 2>/dev/null | grep -wq "Welcome to nginx"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 将 http 请求重定向到 https"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 7 )
+		print_PASS; 
+		echo "Task$TN. 使用 HTTPS 路由来公开 web 应用程序"
+	fi
+}
+
+
+function grade_serviceAccount {
+  TN=10
+  MQ=1
+	if kubectl -n monitoring get sa stats-monitor-sa -o yaml 2>/dev/null | grep -wq automountServiceAccountToken.*false; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 以关闭 API 凭据自动挂载"
+    MQ=0
+  fi
+  if kubectl -n monitoring get deploy stats-monitor -o yaml 2>/dev/null | grep -wq "mountPath: /var/run/secrets/kubernetes.io/serviceaccount"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 装载以下位置的 ServiceAccount token"
+    MQ=0
+  fi
+  if kubectl -n monitoring get deployments.apps stats-monitor -o yaml 2>/dev/null | grep -A 1 volumes: | grep -wq token && \
+    kubectl -n monitoring get deployments.apps stats-monitor -o yaml 2>/dev/null | grep -wq "readOnly: true"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 使用有效期为 1800 秒，名字为 token 的 Projected Volume"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. 合规的服务账号令牌"
+	fi
+}
+
+function grade_upgrde_node {
+  TN=11
+  MQ=1
+  VERSION=$(kubectl get nodes | awk '/k8s-master/ {print $5}')
+  if kubectl get nodes k8s-node2 | grep -wq $VERSION; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 升级集群节点 k8s-node2 以匹配控制面板节点的版本"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. kubeadm upgrade node"
+	fi
+}
+
+function grade_bom {
+  TN=12
+  MQ=1
+  if sudo grep SPDXVersion /home/vagrant/alpine.spdx 2>/dev/null | grep -wq SPDX-2.3; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 该版本镜像的 SPDX 文档存储到 ~/alpine.spdx 中"
+    MQ=0
+  fi
+  if ! kubectl -n alpine describe deploy alpine | grep -wq alpine:3.19.1; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 从 Deployment 中删除此镜像版本 alipine 的容器"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. 使用预先安装的 bom 工具生成 SPDX 文档"
+	fi
+}
+
+function grade_ValidatingAdmissionPolicy {
+  TN=13
+  MQ=1
+  if kubectl -n confidential get deploy nginx 2>/dev/null | grep -wq 1/1; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 在 confidential 命名空间中，有不符合受限 Pod 安全标准的 Deployment"
+    MQ=0
+  fi
+  if kubectl -n confidential get po 2>/dev/null | grep -wq Running; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 修改这个 Deployment 以符合要求，并验证 Pod 可以正常运行"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. 强制执行受限的 Pod 安全标准"
+	fi
+}
+
+function grade_docker {
+  TN=14
+  MQ=1
+  if ! id developer 2>/dev/null | grep -wq groups.*docker; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 从 docker 群组中删除用户 developer"
+    MQ=0
+  fi
+  if sshpass -p vagrant ssh root@k8s-node2 "ls -l /var/run/docker.sock" | awk '{print $4}' | grep -wq root; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 位于 /var/run/docker.sock 的套接字文件属组为 root 群组"
+    MQ=0
+  fi
+  if ! sshpass -p vagrant ssh root@k8s-node2 "ss -antl" | grep -wq 2375; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 不会监听任何 TCP 端口"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. 重新配置并重启 Docker 守护进程"
+	fi
+}
+
+function grade_CiliumNetworkPolicy {
+  TN=15
+  MQ=1
+	if kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+      | grep -A 3 endpointSelector | grep -wq "app: nodebb"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 允许命名空间 ingress-nginx-controller 的 Pods 访问 Deployment nodebb 的 Pods"
+    MQ=0
+  fi
+	if kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+      | grep -A 2 authentication | grep -wq "mode: required" && \
+      kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+      | grep -A 2 authentication | grep -wq "fromEndpoints"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 需要双向认证"
+    MQ=0
+  fi
+	if kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+    | grep -A 2 fromEndpoints | grep -wq "io.kubernetes.pod.namespace: ingress-nginx" && \
+    kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+    | grep -A 1 fromEntities | grep -wq "host"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 允许主机访问 Deployment nodebb 的 Pods"
+    MQ=0
+  fi
+  if kubectl -n nodebb get ciliumnetworkpolicies.cilium.io nodebb -o yaml 2>/dev/null \
+      | grep -A 2 authentication | grep -vwq "fromEntities"; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 不要使用双向认证"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. CiliumNetworkPolicy"
+	fi
+}
+
+function grade_deploy_secret {
+  TN=16
+  MQ=1
+  kubectl -n apache get secrets tls-secret -o jsonpath="{ .data.tls\.crt }" 2>/dev/null | base64 -d > /tmp/tls.crt
+  kubectl -n apache get secrets tls-secret -o jsonpath="{ .data.tls\.key }" 2>/dev/null | base64 -d > /tmp/tls.key
+	if diff /tmp/tls.crt /home/vagrant/www.k8s.local.crt &>/dev/null && \
+    diff /tmp/tls.key /home/vagrant/www.k8s.local.key &>/dev/null; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 在命名空间 apache 中创建一个名为 tls-secret 的 TLS Secret"
+    MQ=0
+  fi
+  VN=$(kubectl -n apache describe deployment/httpd-deployment 2>/dev/null | grep -B 2 tls-secret | awk -F: 'NR==1 {print $1}' | sed 's/ //g')
+	if kubectl -n apache describe deployment/httpd-deployment 2>/dev/null | grep /etc/httpd/ssl.*$VN | grep -wq ro; then
+    MQ1
+  else
+    print_FAIL; echo "Task$TN- 将 Secret tls-secret 以只读方式挂载到 /etc/httpd/ssl 中"
+    MQ=0
+  fi
+  if [ "$MQ" = "1" ]; then
+		SCORE=$(expr $SCORE + 5 )
+		print_PASS; 
+		echo "Task$TN. 使用存储在 TLS Secret 中的 SSL 文件，来保护 web server 的访问"
+	fi
+}
+
+
+# Main Area
+K_VER=$(kubectl get node | awk '/control-plane/ {print $5}')
+echo
+COST=$(uptime -p | sed -e 's/ hours, /h/' -e 's/ minutes/m/')
+echo -e " Spend Time: \e[1;32m${COST}\e[0;39m, $(date '+%Y-%m-%d %a %H:%M')"
+LINE
+    if [ "$#" = "0" ]; then
+        grade_bench
+        grade_apiServer
+        grade_imagePolicyWebhook
+        grade_dockerfile
+        grade_security_threats
+        grade_securityContext
+        grade_audit
+        grade_networkPolicy
+        grade_ingess_https
+        grade_serviceAccount
+        grade_upgrde_node
+        grade_bom
+        grade_ValidatingAdmissionPolicy
+        grade_docker
+       #grade_CiliumNetworkPolicy
+        grade_deploy_secret
+    else
+        case $1 in
+        1)
+            grade_bench ;;
+        2)
+            grade_deploy_secret ;;
+        3)
+            grade_dockerfile;;
+        4)
+            grade_security_threats ;;
+        5)
+            grade_securityContext ;;
+        6)
+            grade_audit ;;
+        7)
+            grade_networkPolicy ;;
+        8)
+            grade_ingess_https ;;
+        9)
+            grade_serviceAccount ;;
+        10)
+            grade_upgrde_node ;;
+        11)
+            grade_bom ;;
+        12)
+            grade_ValidatingAdmissionPolicy ;;
+        13)
+            grade_docker ;;
+        14)
+            echo "delete grade_CiliumNetworkPolicy" ;;
+        15)
+            grade_imagePolicyWebhook ;;
+        16)
+            grade_apiServer ;;
+        *)
+            exit ;;
+        esac
+    fi
+LINE
+export SCRIPT_COUNT=$# && LCOURSE
+echo
