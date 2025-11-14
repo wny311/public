@@ -202,8 +202,6 @@ function hongkong {
 #main 
 touch /tmp/$(date +%m%d-%H%M).begin
 
-service_restart_accept
-
 pkg_prepare_install
 
 module_install
