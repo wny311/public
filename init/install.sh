@@ -55,11 +55,12 @@ function runtime_install_docker {
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
-  echo 
+
+  echo \
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
     "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
     sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  
+ 
   apt update && DEBIAN_FRONTEND=noninteractive apt -y install docker-ce
   mkdir -p /etc/docker
   tee /etc/docker/daemon.json >/dev/null<<-EOF
@@ -196,7 +197,7 @@ function cni_cilium_install {
 }
 
 function hongkong {
-	kubectl taint node k8s-master node-role.kubernetes.io/control-plane:NoSchedule-
+	kubectl taint node master01 node-role.kubernetes.io/control-plane:NoSchedule-
 }
 
 #main 
