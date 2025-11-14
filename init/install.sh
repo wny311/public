@@ -4,7 +4,7 @@ set -euxo pipefail
 
 export NODENAME=$1
 
-case $(NODENAME) in
+case $NODENAME in
   master01|worker01)
 	export RUNTIME=containerd
 	;;
