@@ -23,13 +23,13 @@ function module_install {
   DEBIAN_FRONTEND=noninteractive apt -y install bridge-utils
   tee /etc/modules-load.d/br.conf >/dev/null<<-EOF
   	br_netfilter
-  EOF
+EOF
 
   modprobe br_netfilter
 
   tee /etc/sysctl.d/k8s.conf >/dev/null<<-EOF
   	net.ipv4.ip_forward=1
-  EOF
+EOF
 
   sysctl -p /etc/sysctl.d/k8s.conf
 }
@@ -70,7 +70,7 @@ function runtime_install_docker {
 	    "max-file": "10"
 	  }
 	}
-  EOF
+EOF
   
   systemctl daemon-reload
   systemctl restart docker
