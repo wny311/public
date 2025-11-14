@@ -107,12 +107,12 @@ function kubeadm_tab {
 	[ ! -d /root/.kube ] && mkdir /root/.kube
 	source <(kubeadm completion bash)
 
-	kubeadm completion bash | tee /etc/bash_completion.d/kubeadm >/dev/null
+	kubeadm completion bash | tee /usr/share/bash-completion/completions/kubeadm >/dev/null
 }
 
 function client_tab {
 	source <(kubectl completion bash)
-	kubectl completion bash | tee /etc/bash_completion.d/kubectl >/dev/null
+	kubectl completion bash | tee /usr/share/bash-completion/completions/kubectl >/dev/null
 }
 
 function pause_image_version {
@@ -148,7 +148,7 @@ function crictl_config {
   esac
      
   source <(crictl completion bash)
-  crictl completion bash | tee /etc/bash_completion.d/crictl >/dev/null
+  crictl completion bash | tee /usr/share/bash-completion/completions/crictl >/dev/null
 }
 
 function kubeadm_init {
@@ -197,7 +197,7 @@ function cni_cilium_install {
   cilium status
 
   source <(cilium completion bash)
-  cilium completion bash | tee /etc/bash_completion.d/cilium >/dev/null
+  cilium completion bash | tee /usr/share/bash-completion/completions/cilium >/dev/null
 }
 
 function hongkong {
