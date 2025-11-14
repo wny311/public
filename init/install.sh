@@ -20,6 +20,10 @@ function pkg_prepare_install {
   done
 }
 
+function service_restart_accept {
+  sed -i /etc/needrestart/needrestart.conf -e '/nrconf{restart}/{s+i+a+;s+#++}'
+}
+
 function module_install {
   DEBIAN_FRONTEND=noninteractive apt -y install bridge-utils
   tee /etc/modules-load.d/br.conf >/dev/null<<-EOF
@@ -79,7 +83,7 @@ EOF
   
   local CLI_ARCH=amd64
   local C_VERSION=$(curl -sL https://api.github.com/repos/Mirantis/cri-dockerd/releases/latest | awk '/tag_name/ {print $2}' | sed 's/[",v]//g')
-  until curl -#LO ${CURL}https://github.com/Mirantis/cri-dockerd/releases/download/v$C_VERSION/cri-dockerd_$C_VERSION.3-0.ubuntu-jammy_$CLI_ARCH.deb; do
+  until curl -#LO https://github.com/Mirantis/cri-dockerd/releases/download/v$C_VERSION/cri-dockerd_$C_VERSION.3-0.ubuntu-jammy_$CLI_ARCH.deb; do
     sleep 1
   done
   dpkg -i cri-dockerd_${C_VERSION}.3-0.ubuntu-jammy_${CLI_ARCH}.deb
@@ -202,6 +206,8 @@ function hongkong {
 
 #main 
 touch /tmp/$(date +%m%d-%H%M).begin
+
+service_restart_accept
 
 pkg_prepare_install
 
