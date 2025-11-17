@@ -165,6 +165,8 @@ function kubeadm_init {
 function client_config {
 	echo "export KUBECONFIG=/etc/kubernetes/admin.conf" | tee -a /root/.bashrc
 	export KUBECONFIG=/etc/kubernetes/admin.conf
+  mkdir -p /root/.kube
+  cp /etc/kubernetes/admin.conf /root/.kube/config
 }
 
 function kubeadm_join {
