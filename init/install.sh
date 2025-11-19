@@ -206,10 +206,20 @@ function hongkong {
 	kubectl taint node master01 node-role.kubernetes.io/control-plane:NoSchedule-
 }
 
+function passwd_root {
+	# 生成 ssh 客户端配置文件
+	tee /etc/ssh/ssh_config.d/k8s.conf >/dev/null<<-EOF
+    Host *
+      StrictHostKeyChecking no
+EOF
+}
+
 #main 
 touch /tmp/$(date +%m%d-%H%M).begin
 
 service_restart_accept
+
+passwd_root
 
 pkg_prepare_install
 
