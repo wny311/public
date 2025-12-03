@@ -195,8 +195,7 @@ function cni_cilium_install {
   rm cilium-linux-${CLI_ARCH}.tar.gz
 
   cilium install --set ipam.operator.clusterPoolIPv4PodCIDRList="10.244.0.0/16" \
-    --set ipv4NativeRoutingCIDR="10.244.0.0/16" \
-    --set ipam="cluster-pool"  --wait
+    --set ipv4NativeRoutingCIDR="10.244.0.0/16" --wait
 
   cilium status
 
